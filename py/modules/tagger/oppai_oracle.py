@@ -1,20 +1,32 @@
 import csv
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from .format import remove_underline
-from .overlap import drop_overlap_tags
 
-
-_LABEL_CACHE: dict[tuple[str, bool], tuple[list[str], dict[str, list[int]]]] = {}
+_LABEL_CACHE: dict[str, tuple[list[str], dict[str, list[int]]]] = {}
 _PREPROCESS_CACHE: dict[str, dict] = {}
 
 
-def load_oppai_oracle_labels(csv_path: Path, no_underline: bool = False) -> tuple[list[str], dict[str, list[int]]]:
-    key = (str(csv_path), no_underline)
+def load_oppai_oracle_labels(csv_path: Path) -> tuple[list[str], dict[str, list[int]]]:
+    """Oppai Oracle の selected_tags.csv を読み込みます。
+
+    CSV パスを受け取り、タグ名リストと rating/character/general のインデックス辞書を返します。
+
+    Parameters
+    ----------
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+
+    Returns
+    -------
+    returns : tuple[list[str], dict[str, list[int]]]
+        複数の処理結果をまとめたタプルを返します。
+    """
+    key = str(csv_path)
     if key in _LABEL_CACHE:
         return _LABEL_CACHE[key]
 
@@ -28,8 +40,6 @@ def load_oppai_oracle_labels(csv_path: Path, no_underline: bool = False) -> tupl
 
         for index, row in enumerate(records):
             tag = row.get("name") or row.get("tag") or row.get("tag_name") or ""
-            if no_underline:
-                tag = remove_underline(tag)
             tag_names.append(tag)
 
             category = int(row.get("category", 0) or 0) if str(row.get("category", "")).strip() else 0
@@ -47,6 +57,20 @@ def load_oppai_oracle_labels(csv_path: Path, no_underline: bool = False) -> tupl
 
 
 def load_oppai_oracle_preprocess(preprocess_path: Path | None) -> dict:
+    """Oppai Oracle の前処理設定を読み込みます。
+
+    preprocessing.json のパスまたは `None` を受け取り、画像サイズ、余白色、mean/std を含む辞書を返します。
+
+    Parameters
+    ----------
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : dict
+        処理結果を格納した辞書を返します。
+    """
     if preprocess_path is None or not preprocess_path.exists():
         return {
             "image_size": 448,
@@ -72,7 +96,23 @@ def load_oppai_oracle_preprocess(preprocess_path: Path | None) -> dict:
     return data
 
 
-def _target_size_from_session(session, preprocess: dict) -> int:
+def _target_size_from_session(session: Any, preprocess: dict) -> int:
+    """ONNX セッションと前処理設定から入力画像サイズを決めます。
+
+    ONNX セッションと前処理辞書を受け取り、`pixel_values` 入力 shape の空間サイズ、または設定上の `image_size` を返します。
+
+    Parameters
+    ----------
+    session : Any
+        ONNX Runtime の推論セッションです。
+    preprocess : dict
+        前処理設定を格納した辞書です。
+
+    Returns
+    -------
+    returns : int
+        計算または推定した整数値を返します。
+    """
     for input_info in session.get_inputs():
         if input_info.name == "pixel_values":
             int_dims = [dim for dim in input_info.shape if isinstance(dim, int)]
@@ -86,6 +126,24 @@ def prepare_image_for_oppai_oracle(
     target_size: int,
     preprocess: dict,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Oppai Oracle 用に画像と padding mask を前処理します。
+
+    RGB `uint8 [H, W, 3]` 画像、入力サイズ、前処理設定を受け取り、`pixel_values [1, 3, H, W]` と `padding_mask [1, H, W]` を返します。
+
+    Parameters
+    ----------
+    image_np : np.ndarray
+        RGB 形式の uint8 画像配列です。
+    target_size : int
+        モデル入力に合わせる画像サイズです。
+    preprocess : dict
+        前処理設定を格納した辞書です。
+
+    Returns
+    -------
+    returns : tuple[np.ndarray, np.ndarray]
+        複数の処理結果をまとめたタプルを返します。
+    """
     image = Image.fromarray(image_np, mode="RGB")
     width, height = image.size
     scale = min(target_size / width, target_size / height)
@@ -109,81 +167,64 @@ def prepare_image_for_oppai_oracle(
     return np.expand_dims(array, axis=0).astype(np.float32), np.expand_dims(padding_mask, axis=0)
 
 
-def postprocess_oppai_oracle(
+def oppai_oracle_output_from_prediction(
     pred: np.ndarray,
     csv_path: Path,
-    threshold: float = 0.753,
-    no_underline: bool = False,
-    drop_overlap: bool = False,
 ) -> dict[str, dict[str, float] | np.ndarray]:
-    tag_names, indexes_by_group = load_oppai_oracle_labels(csv_path, no_underline)
-    result: dict[str, dict[str, float] | np.ndarray] = {}
-    all_tags: dict[str, float] = {}
+    """Oppai Oracle の予測ベクトルを全タグスコア辞書へ変換します。
 
-    for group_name, indexes in indexes_by_group.items():
-        selected = {
-            tag_names[index]: float(pred[index])
-            for index in indexes
-            if index < len(pred)
-            and tag_names[index]
-            and tag_names[index] not in {"<PAD>", "<UNK>"}
-            and float(pred[index]) > threshold
-        }
-        if drop_overlap and group_name == "general":
-            selected = drop_overlap_tags(selected)
-        result[group_name] = selected
-        if group_name != "rating":
-            all_tags.update(selected)
+    Parameters
+    ----------
+    pred : np.ndarray
+        モデルが返したタグごとの確率ベクトルです。
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
 
-    result["tag"] = all_tags
-    result["prediction"] = pred.astype(np.float32)
-    return result
+    Returns
+    -------
+    dict[str, dict[str, float] | np.ndarray]
+        `tag` にしきい値未適用の全タグスコア、`prediction` に元の予測ベクトルを格納した辞書です。
+    """
+    tag_names, _indexes_by_group = load_oppai_oracle_labels(csv_path)
 
+    tag_scores = {
+        tag: float(score)
+        for tag, score in zip(tag_names, pred.astype(float))
+        if tag and tag not in {"<PAD>", "<UNK>"}
+    }
 
-def get_oppai_oracle_tags(
-    image_np: np.ndarray,
-    session,
-    csv_path: Path,
-    preprocess_path: Path | None = None,
-    threshold: float = 0.753,
-    no_underline: bool = False,
-    drop_overlap: bool = False,
-) -> dict[str, dict[str, float] | np.ndarray]:
-    preprocess = load_oppai_oracle_preprocess(preprocess_path)
-    pixel_values, padding_mask = prepare_image_for_oppai_oracle(
-        image_np,
-        _target_size_from_session(session, preprocess),
-        preprocess,
-    )
-
-    input_map = {}
-    for input_info in session.get_inputs():
-        if input_info.name == "pixel_values":
-            input_map[input_info.name] = pixel_values
-        elif input_info.name == "padding_mask":
-            input_map[input_info.name] = padding_mask
-
-    output_names = [output.name for output in session.get_outputs()]
-    output_values = session.run(output_names, input_map)
-    pred = output_values[0][0]
-    if "probabilities" in output_names:
-        pred = output_values[output_names.index("probabilities")][0]
-
-    return postprocess_oppai_oracle(
-        pred,
-        csv_path=csv_path,
-        threshold=threshold,
-        no_underline=no_underline,
-        drop_overlap=drop_overlap,
-    )
+    return {
+        "tag": tag_scores,
+        "prediction": pred.astype(np.float32),
+    }
 
 
 def predict_oppai_oracle_tags(
     image_np: np.ndarray,
-    session,
+    session: Any,
     csv_path: Path,
     preprocess_path: Path | None = None,
 ) -> dict[str, dict[str, float] | np.ndarray]:
+    """Oppai Oracle を ONNX Runtime で推論し、全タグスコアを返します。
+
+    RGB `uint8` 画像、ONNX セッション、CSV/preprocess パスを受け取り、しきい値未適用の全タグスコア辞書を返します。
+
+    Parameters
+    ----------
+    image_np : np.ndarray
+        RGB 形式の uint8 画像配列です。
+    session : Any
+        ONNX Runtime の推論セッションです。
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : dict[str, dict[str, float] | np.ndarray]
+        処理結果を格納した辞書を返します。
+    """
     preprocess = load_oppai_oracle_preprocess(preprocess_path)
     pixel_values, padding_mask = prepare_image_for_oppai_oracle(
         image_np,
@@ -203,23 +244,55 @@ def predict_oppai_oracle_tags(
     pred = output_values[0][0]
     if "probabilities" in output_names:
         pred = output_values[output_names.index("probabilities")][0]
+    return oppai_oracle_output_from_prediction(pred, csv_path)
 
-    tag_names, indexes_by_group = load_oppai_oracle_labels(csv_path, no_underline=False)
-    result: dict[str, dict[str, float] | np.ndarray] = {}
-    all_tags: dict[str, float] = {}
 
-    for group_name, indexes in indexes_by_group.items():
-        selected = {
-            tag_names[index]: float(pred[index])
-            for index in indexes
-            if index < len(pred)
-            and tag_names[index]
-            and tag_names[index] not in {"<PAD>", "<UNK>"}
-        }
-        result[group_name] = selected
-        if group_name != "rating":
-            all_tags.update(selected)
+def predict_oppai_oracle_tags_tensorrt(
+    image_np: np.ndarray,
+    runner: Any,
+    csv_path: Path,
+    preprocess_path: Path | None = None,
+) -> dict[str, dict[str, float] | np.ndarray]:
+    """Oppai Oracle を TensorRT で推論し、全タグスコアを返します。
 
-    result["tag"] = all_tags
-    result["prediction"] = pred.astype(np.float32)
-    return result
+    RGB `uint8` 画像、TensorRT runner、CSV/preprocess パスを受け取り、しきい値未適用の全タグスコア辞書を返します。
+
+    Parameters
+    ----------
+    image_np : np.ndarray
+        RGB 形式の uint8 画像配列です。
+    runner : Any
+        TensorRT 推論 runner です。
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : dict[str, dict[str, float] | np.ndarray]
+        処理結果を格納した辞書を返します。
+    """
+    preprocess = load_oppai_oracle_preprocess(preprocess_path)
+    target_size = int(preprocess.get("image_size", 448))
+    for input_name in runner.input_names:
+        if input_name == "pixel_values":
+            shape = runner.engine.get_tensor_shape(input_name)
+            int_dims = [int(dim) for dim in shape if int(dim) > 3]
+            if int_dims:
+                target_size = max(int_dims)
+
+    pixel_values, padding_mask = prepare_image_for_oppai_oracle(image_np, target_size, preprocess)
+
+    input_map = {}
+    for input_name in runner.input_names:
+        if input_name == "pixel_values":
+            input_map[input_name] = pixel_values
+        elif input_name == "padding_mask":
+            input_map[input_name] = padding_mask
+
+    output_values = runner.run(input_map, runner.output_names)
+    pred = output_values[0][0]
+    if "probabilities" in runner.output_names:
+        pred = output_values[runner.output_names.index("probabilities")][0]
+    return oppai_oracle_output_from_prediction(pred, csv_path)

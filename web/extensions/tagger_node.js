@@ -10,13 +10,16 @@ const THRESHOLD_WIDGETS = [
     "threshold",
     "character_threshold",
     "copyright_threshold",
+    "artist_threshold",
     "meta_threshold",
     "rating_threshold",
 ];
 
 const INCLUDE_THRESHOLD_PAIRS = [
+    ["include_general", "threshold"],
     ["include_character", "character_threshold"],
     ["include_copyright", "copyright_threshold"],
+    ["include_artist", "artist_threshold"],
     ["include_meta", "meta_threshold"],
     ["include_rating", "rating_threshold"],
 ];
@@ -90,12 +93,12 @@ function resizeNodeToWidgets(node) {
 
 function updateThresholdWidgets(node) {
     const useDefaultThreshold = Boolean(findWidget(node, "use_default_threshold")?.value);
-
-    setWidgetVisible(node, "threshold", !useDefaultThreshold);
+    const mcutThreshold = Boolean(findWidget(node, "mcut_threshold")?.value);
+    const thresholdInputsEnabled = !useDefaultThreshold && !mcutThreshold;
 
     for (const [includeName, thresholdName] of INCLUDE_THRESHOLD_PAIRS) {
         const includeWidget = findWidget(node, includeName);
-        const visible = !useDefaultThreshold && Boolean(includeWidget?.value);
+        const visible = thresholdInputsEnabled && Boolean(includeWidget?.value);
         setWidgetVisible(node, thresholdName, visible);
     }
 
@@ -135,6 +138,7 @@ function interceptWidgetValue(widget, onChange) {
 function setupThresholdWidgetVisibility(node) {
     THRESHOLD_WIDGETS.forEach(name => rememberWidget(findWidget(node, name)));
     interceptWidgetValue(findWidget(node, "use_default_threshold"), () => updateThresholdWidgets(node));
+    interceptWidgetValue(findWidget(node, "mcut_threshold"), () => updateThresholdWidgets(node));
     INCLUDE_THRESHOLD_PAIRS.forEach(([includeName]) => {
         interceptWidgetValue(findWidget(node, includeName), () => updateThresholdWidgets(node));
     });

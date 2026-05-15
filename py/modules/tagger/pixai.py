@@ -1,26 +1,50 @@
 import csv
 import ast
 import json
-from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from .format import remove_underline
-from .overlap import drop_overlap_tags
 
-
-_LABEL_CACHE: dict[tuple[str, bool], tuple[list[str], dict[int, list[int]], dict[str, list[str]]]] = {}
-_THRESHOLD_CACHE: dict[str, tuple[dict[int, float], dict[int, str]]] = {}
+_LABEL_CACHE: dict[str, tuple[list[str], dict[int, list[int]], dict[str, list[str]]]] = {}
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
+    """NumPy 配列へ sigmoid を適用します。
+
+    logits 配列を受け取り、0..1 範囲の確率配列を返します。
+
+    Parameters
+    ----------
+    x : np.ndarray
+        計算対象の NumPy 配列です。
+
+    Returns
+    -------
+    returns : np.ndarray
+        変換または推論で得た NumPy 配列を返します。
+    """
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def load_pixai_labels(csv_path: Path, no_underline: bool = False) -> tuple[list[str], dict[int, list[int]], dict[str, list[str]]]:
-    key = (str(csv_path), no_underline)
+def load_pixai_labels(csv_path: Path) -> tuple[list[str], dict[int, list[int]], dict[str, list[str]]]:
+    """PixAI selected_tags.csv を読み込みます。
+
+    CSV パスを受け取り、タグ名リスト、カテゴリ番号別インデックス辞書、キャラクタータグから作品 IP への対応辞書を返します。
+
+    Parameters
+    ----------
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+
+    Returns
+    -------
+    returns : tuple[list[str], dict[int, list[int]], dict[str, list[str]]]
+        複数の処理結果をまとめたタプルを返します。
+    """
+    key = str(csv_path)
     if key in _LABEL_CACHE:
         return _LABEL_CACHE[key]
 
@@ -35,8 +59,6 @@ def load_pixai_labels(csv_path: Path, no_underline: bool = False) -> tuple[list[
 
         for index, row in enumerate(records):
             tag = row.get("name", "")
-            if no_underline:
-                tag = remove_underline(tag)
             tag_names.append(tag)
 
             if "category" in row and row.get("category") != "":
@@ -62,33 +84,21 @@ def load_pixai_labels(csv_path: Path, no_underline: bool = False) -> tuple[list[
     return value
 
 
-def load_pixai_thresholds(path: Path | None) -> tuple[dict[int, float], dict[int, str]]:
-    if path is None or not path.exists():
-        return {0: 0.30, 4: 0.85}, {0: "general", 4: "character"}
+def _target_size_from_session(session: Any) -> int:
+    """PixAI ONNX セッションから入力画像サイズを推定します。
 
-    key = str(path)
-    if key in _THRESHOLD_CACHE:
-        return _THRESHOLD_CACHE[key]
+    ONNX セッションを受け取り、入力 shape から最大の空間サイズを返します。推定できない場合は 448 を返します。
 
-    thresholds: dict[int, float] = {}
-    category_names: dict[int, str] = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            category = int(row["category"])
-            thresholds[category] = float(row["threshold"])
-            category_names[category] = row.get("name", str(category))
+    Parameters
+    ----------
+    session : Any
+        ONNX Runtime の推論セッションです。
 
-    thresholds.setdefault(0, 0.30)
-    thresholds.setdefault(4, 0.85)
-    category_names.setdefault(0, "general")
-    category_names.setdefault(4, "character")
-    value = (thresholds, category_names)
-    _THRESHOLD_CACHE[key] = value
-    return value
-
-
-def _target_size_from_session(session) -> int:
+    Returns
+    -------
+    returns : int
+        計算または推定した整数値を返します。
+    """
     shape = session.get_inputs()[0].shape
     int_dims = [dim for dim in shape if isinstance(dim, int)]
     if len(int_dims) >= 2:
@@ -97,6 +107,20 @@ def _target_size_from_session(session) -> int:
 
 
 def _normalize_from_preprocess(preprocess_path: Path | None) -> tuple[list[float], list[float]]:
+    """preprocess.json から正規化 mean/std を決めます。
+
+    preprocess.json のパスまたは `None` を受け取り、RGB mean リストと std リストのタプルを返します。
+
+    Parameters
+    ----------
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : tuple[list[float], list[float]]
+        複数の処理結果をまとめたタプルを返します。
+    """
     if preprocess_path is None or not preprocess_path.exists():
         return [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
 
@@ -112,6 +136,24 @@ def _normalize_from_preprocess(preprocess_path: Path | None) -> tuple[list[float
 
 
 def prepare_image_for_pixai(image_np: np.ndarray, target_size: int, preprocess_path: Path | None = None) -> np.ndarray:
+    """PixAI モデル用に画像を前処理します。
+
+    RGB `uint8 [H, W, 3]` 画像、入力サイズ、任意の preprocess パスを受け取り、正規化済み `float32 [1, 3, H, W]` を返します。
+
+    Parameters
+    ----------
+    image_np : np.ndarray
+        RGB 形式の uint8 画像配列です。
+    target_size : int
+        モデル入力に合わせる画像サイズです。
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : np.ndarray
+        変換または推論で得た NumPy 配列を返します。
+    """
     image = Image.fromarray(image_np, mode="RGB")
     if image.size != (target_size, target_size):
         image = image.resize((target_size, target_size), Image.Resampling.BICUBIC)
@@ -123,69 +165,23 @@ def prepare_image_for_pixai(image_np: np.ndarray, target_size: int, preprocess_p
     return np.expand_dims(array, axis=0).astype(np.float32)
 
 
-def postprocess_pixai(
-    pred: np.ndarray,
-    csv_path: Path,
-    thresholds_path: Path | None = None,
-    threshold: float | None = None,
-    character_threshold: float | None = None,
-    no_underline: bool = False,
-    drop_overlap: bool = False,
-) -> dict[str, dict[str, float] | list[str] | np.ndarray]:
-    tag_names, indexes_by_category, ips_mapping_all = load_pixai_labels(csv_path, no_underline)
-    default_thresholds, category_names = load_pixai_thresholds(thresholds_path)
-    if threshold is not None:
-        default_thresholds[0] = threshold
-    if character_threshold is not None:
-        default_thresholds[4] = character_threshold
+def _prediction_from_outputs(output_names: list[str], output_values: list[np.ndarray]) -> np.ndarray:
+    """PixAI の ONNX/TensorRT 出力から確率ベクトルを取り出します。
 
-    result: dict[str, dict[str, float] | list[str] | np.ndarray] = {}
-    all_tags: dict[str, float] = {}
-    for category, indexes in indexes_by_category.items():
-        category_name = category_names.get(category, str(category))
-        category_threshold = default_thresholds.get(category, threshold if threshold is not None else 0.35)
-        selected = {
-            tag_names[index]: float(pred[index])
-            for index in indexes
-            if index < len(pred) and pred[index] > category_threshold
-        }
-        if drop_overlap and category == 0:
-            selected = drop_overlap_tags(selected)
-        result[category_name] = selected
-        if category != 9:
-            all_tags.update(selected)
+    出力名リストと出力配列リストを受け取り、`prediction` を優先し、logits の場合は sigmoid 済みの1次元配列を返します。
 
-    character_tags = result.get("character", {})
-    ips_mapping = {
-        tag: ips_mapping_all[tag]
-        for tag in character_tags
-        if tag in ips_mapping_all
-    } if isinstance(character_tags, dict) else {}
-    ips_count = Counter(ip for values in ips_mapping.values() for ip in values)
+    Parameters
+    ----------
+    output_names : list[str]
+        取得する出力テンソル名のリストです。
+    output_values : list[np.ndarray]
+        推論ランタイムから返された出力配列リストです。
 
-    result["tag"] = all_tags
-    result["ips_mapping"] = ips_mapping
-    result["ips_count"] = dict(ips_count)
-    result["ips"] = [ip for ip, _ in sorted(ips_count.items(), key=lambda item: (-item[1], item[0]))]
-    result["prediction"] = pred.astype(np.float32)
-    return result
-
-
-def get_pixai_tags(
-    image_np: np.ndarray,
-    session,
-    csv_path: Path,
-    thresholds_path: Path | None = None,
-    preprocess_path: Path | None = None,
-    threshold: float | None = None,
-    character_threshold: float | None = None,
-    no_underline: bool = False,
-    drop_overlap: bool = False,
-) -> dict[str, dict[str, float] | list[str] | np.ndarray]:
-    input_info = session.get_inputs()[0]
-    input_np = prepare_image_for_pixai(image_np, _target_size_from_session(session), preprocess_path)
-    output_names = [output.name for output in session.get_outputs()]
-    output_values = session.run(output_names, {input_info.name: input_np})
+    Returns
+    -------
+    returns : np.ndarray
+        変換または推論で得た NumPy 配列を返します。
+    """
     output_map = {name: value[0] for name, value in zip(output_names, output_values)}
     pred = output_map.get("prediction")
     if pred is None:
@@ -193,63 +189,128 @@ def get_pixai_tags(
         if pred is None:
             pred = output_values[0][0]
         pred = sigmoid(pred)
+    return pred
 
-    return postprocess_pixai(
-        pred,
-        csv_path=csv_path,
-        thresholds_path=thresholds_path,
-        threshold=threshold,
-        character_threshold=character_threshold,
-        no_underline=no_underline,
-        drop_overlap=drop_overlap,
-    )
 
+def pixai_output_from_prediction(
+    pred: np.ndarray,
+    csv_path: Path,
+) -> dict[str, dict[str, float] | np.ndarray]:
+    """PixAI の予測ベクトルを全タグスコア辞書へ変換します。
+
+    確率ベクトルと CSV パスを受け取り、全タグスコアと `prediction` を含む辞書を返します。
+    PixAI では character タグの IP 対応から copyright 相当タグのスコアも合成します。
+
+    Parameters
+    ----------
+    pred : np.ndarray
+        モデルが返したタグごとのスコアまたは確率ベクトルです。
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+    Returns
+    -------
+    returns : dict[str, dict[str, float] | np.ndarray]
+        処理結果を格納した辞書を返します。
+    """
+    tag_names, indexes_by_category, ips_mapping_all = load_pixai_labels(csv_path)
+    
+    tag_scores = {
+        tag: float(score)
+        for tag, score in zip(tag_names, pred.astype(float))
+        if tag
+    }
+    
+    # pixaiでは ip (copyright) のタグは character タグから決まるため
+    # その copyright タグに所属する character タグの最大値を使う
+    copyright_scores = {}
+    for character_tag, ips in ips_mapping_all.items():
+        character_score = tag_scores.get(character_tag)
+        if character_score is None:
+            continue
+        for ip in ips:
+            copyright_scores[ip] = max(
+                copyright_scores.get(ip, float("-inf")), 
+                character_score, 
+            )
+    tag_scores.update(copyright_scores)
+
+    return {
+        "tag": tag_scores, 
+        "prediction": pred.astype(np.float32), 
+    }
 
 def predict_pixai_tags(
     image_np: np.ndarray,
-    session,
+    session: Any,
     csv_path: Path,
     thresholds_path: Path | None = None,
     preprocess_path: Path | None = None,
 ) -> dict[str, dict[str, float] | list[str] | np.ndarray]:
+    """PixAI を ONNX Runtime で推論し、全タグスコアを返します。
+
+    RGB `uint8` 画像、ONNX セッション、CSV/preprocess パスを受け取り、しきい値未適用の全タグスコア辞書を返します。
+
+    Parameters
+    ----------
+    image_np : np.ndarray
+        RGB 形式の uint8 画像配列です。
+    session : Any
+        ONNX Runtime の推論セッションです。
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+    thresholds_path : Path | None
+        互換性のために受け取ります。しきい値処理は共通後処理側で行うため、この関数内では使いません。
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : dict[str, dict[str, float] | list[str] | np.ndarray]
+        処理結果を格納した辞書を返します。
+    """
     input_info = session.get_inputs()[0]
     input_np = prepare_image_for_pixai(image_np, _target_size_from_session(session), preprocess_path)
     output_names = [output.name for output in session.get_outputs()]
     output_values = session.run(output_names, {input_info.name: input_np})
-    output_map = {name: value[0] for name, value in zip(output_names, output_values)}
-    pred = output_map.get("prediction")
-    if pred is None:
-        pred = output_map.get("logits")
-        if pred is None:
-            pred = output_values[0][0]
-        pred = sigmoid(pred)
+    pred = _prediction_from_outputs(output_names, output_values)
+    return pixai_output_from_prediction(pred, csv_path)
+    
 
-    tag_names, indexes_by_category, ips_mapping_all = load_pixai_labels(csv_path, no_underline=False)
-    _, category_names = load_pixai_thresholds(thresholds_path)
-    result: dict[str, dict[str, float] | list[str] | np.ndarray] = {}
-    all_tags: dict[str, float] = {}
-    for category, indexes in indexes_by_category.items():
-        category_name = category_names.get(category, str(category))
-        selected = {
-            tag_names[index]: float(pred[index])
-            for index in indexes
-            if index < len(pred)
-        }
-        result[category_name] = selected
-        if category != 9:
-            all_tags.update(selected)
+def predict_pixai_tags_tensorrt(
+    image_np: np.ndarray,
+    runner: Any,
+    csv_path: Path,
+    thresholds_path: Path | None = None,
+    preprocess_path: Path | None = None,
+) -> dict[str, dict[str, float] | list[str] | np.ndarray]:
+    """PixAI を TensorRT で推論し、全タグスコアを返します。
 
-    character_tags = result.get("character", {})
-    ips_mapping = {
-        tag: ips_mapping_all[tag]
-        for tag in character_tags
-        if tag in ips_mapping_all
-    } if isinstance(character_tags, dict) else {}
-    ips_count = Counter(ip for values in ips_mapping.values() for ip in values)
+    RGB `uint8` 画像、TensorRT runner、CSV/preprocess パスを受け取り、しきい値未適用の全タグスコア辞書を返します。
 
-    result["tag"] = all_tags
-    result["ips_mapping"] = ips_mapping
-    result["ips_count"] = dict(ips_count)
-    result["ips"] = [ip for ip, _ in sorted(ips_count.items(), key=lambda item: (-item[1], item[0]))]
-    result["prediction"] = pred.astype(np.float32)
-    return result
+    Parameters
+    ----------
+    image_np : np.ndarray
+        RGB 形式の uint8 画像配列です。
+    runner : Any
+        TensorRT 推論 runner です。
+    csv_path : Path
+        タグ定義 CSV ファイルのパスです。
+    thresholds_path : Path | None
+        互換性のために受け取ります。しきい値処理は共通後処理側で行うため、この関数内では使いません。
+    preprocess_path : Path | None
+        前処理設定 JSON ファイルのパスです。
+
+    Returns
+    -------
+    returns : dict[str, dict[str, float] | list[str] | np.ndarray]
+        処理結果を格納した辞書を返します。
+    """
+    input_name = runner.input_names[0]
+    shape = runner.engine.get_tensor_shape(input_name)
+    int_dims = [int(dim) for dim in shape if int(dim) > 3]
+    target_size = max(int_dims) if int_dims else 448
+    input_np = prepare_image_for_pixai(image_np, target_size, preprocess_path)
+
+    output_values = runner.run({input_name: input_np}, runner.output_names)
+    pred = _prediction_from_outputs(runner.output_names, output_values)
+    return pixai_output_from_prediction(pred, csv_path)
